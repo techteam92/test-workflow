@@ -1,0 +1,58 @@
+name: Daily Git Mirror Backup
+
+on:
+  schedule:
+    # Run at both 16:00 and 17:00 UTC, then gate to 12:00 America/New_York.
+    # This avoids DST drift between EST and EDT.
+    - cron: "0 16 * * *"
+    - cron: "0 17 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mirror-backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate run to Noon America/New_York
+        id: ny_time_gate
+        shell: bash
+        run: |
+          NY_HOUR="$(TZ=America/New_York date +%H)"
+          if [ "$NY_HOUR" = "12" ]; then
+            echo "run_backup=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_backup=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping: current New York hour is $NY_HOUR, not 12."
+          fi
+
+      - name: Validate required secrets
+        if: steps.ny_time_gate.outputs.run_backup == 'true'
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.SOURCE_REPO_URL }}" ]; then
+            echo "Missing required secret: SOURCE_REPO_URL"
+            exit 1
+          fi
+          if [ -z "${{ secrets.BACKUP_REMOTE_URL }}" ]; then
+            echo "Missing required secret: BACKUP_REMOTE_URL"
+            exit 1
+          fi
+
+      - name: Mirror source repo into backup repo
+        if: steps.ny_time_gate.outputs.run_backup == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKDIR="$(mktemp -d)"
+          cd "$WORKDIR"
+
+          # Clone source as a mirror (all refs, tags, branches).
+          git clone --mirror "${{ secrets.SOURCE_REPO_URL }}" source-mirror.git
+          cd source-mirror.git
+
+          # Force mirror all refs to the backup repository.
+          git remote set-url origin "${{ secrets.BACKUP_REMOTE_URL }}"
+          git push --mirror origin
