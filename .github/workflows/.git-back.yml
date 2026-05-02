@@ -6,7 +6,6 @@ on:
     # This avoids DST drift between EST and EDT.
     - cron: "0 16 * * *"
     - cron: "0 17 * * *"
-  # Run from Actions tab for an immediate mirror (bypasses New York time gate).
   workflow_dispatch:
 
 permissions:
@@ -16,124 +15,44 @@ jobs:
   mirror-backup:
     runs-on: ubuntu-latest
     steps:
-      - name: Gate run to Noon America/New_York (scheduled only)
+      - name: Gate run to Noon America/New_York
         id: ny_time_gate
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          NY_HOUR="$(TZ=America/New_York date +%H)"
+          if [ "$NY_HOUR" = "12" ]; then
             echo "run_backup=true" >> "$GITHUB_OUTPUT"
-            echo "Manual run: mirroring immediately (time gate skipped)."
           else
-            NY_HOUR="$(TZ=America/New_York date +%H)"
-            if [ "$NY_HOUR" = "12" ]; then
-              echo "run_backup=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "run_backup=false" >> "$GITHUB_OUTPUT"
-              echo "Skipping: current New York hour is $NY_HOUR, not 12."
-            fi
+            echo "run_backup=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping: current New York hour is $NY_HOUR, not 12."
           fi
 
       - name: Validate required secrets
         if: steps.ny_time_gate.outputs.run_backup == 'true'
-        env:
-          SOURCE_REPO_URL: ${{ secrets.SOURCE_REPO_URL }}
-          BACKUP_REMOTE_URL: ${{ secrets.BACKUP_REMOTE_URL }}
         shell: bash
         run: |
-          trim_url() { printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
-          SRC="$(trim_url "$SOURCE_REPO_URL")"
-          DST="$(trim_url "$BACKUP_REMOTE_URL")"
-          if [ -z "$SRC" ]; then
+          if [ -z "${{ secrets.SOURCE_REPO_URL }}" ]; then
             echo "Missing required secret: SOURCE_REPO_URL"
             exit 1
           fi
-          if [ -z "$DST" ]; then
+          if [ -z "${{ secrets.BACKUP_REMOTE_URL }}" ]; then
             echo "Missing required secret: BACKUP_REMOTE_URL"
             exit 1
           fi
 
       - name: Mirror source repo into backup repo
         if: steps.ny_time_gate.outputs.run_backup == 'true'
-        env:
-          SOURCE_REPO_URL: ${{ secrets.SOURCE_REPO_URL }}
-          BACKUP_REMOTE_URL: ${{ secrets.BACKUP_REMOTE_URL }}
         shell: bash
         run: |
           set -euo pipefail
-          python3 << 'PY'
-          import os
-          import subprocess
-          import tempfile
-          from urllib.parse import quote, unquote, urlparse, urlunparse
 
-          def trim(s: str) -> str:
-              return "".join(s.split())
+          WORKDIR="$(mktemp -d)"
+          cd "$WORKDIR"
 
-          def split_github_url(label: str, raw: str):
-              """Return (redacted https URL, full URL with percent-encoded user:pass for git)."""
-              raw = trim(raw)
-              p = urlparse(raw)
-              if p.scheme not in ("http", "https") or not p.hostname:
-                  raise SystemExit(f"{label}: invalid URL")
-              if p.hostname.lower() != "github.com":
-                  raise SystemExit(f"{label}: only https://github.com/... is supported")
-              user = unquote(p.username or "")
-              password = unquote(p.password or "")
-              if not user or password == "":
-                  raise SystemExit(
-                      f"{label}: use https://USERNAME:TOKEN@github.com/owner/repo.git"
-                  )
-              host = p.hostname
-              if p.port:
-                  host = f"{p.hostname}:{p.port}"
-              redacted = urlunparse((p.scheme, host, p.path, "", "", ""))
-              uq = quote(user, safe="")
-              pq = quote(password, safe="")
-              netloc = f"{uq}:{pq}@{host}"
-              authed = urlunparse((p.scheme, netloc, p.path, "", "", ""))
-              return redacted, authed
+          # Clone source as a mirror (all refs, tags, branches).
+          git clone --mirror "${{ secrets.SOURCE_REPO_URL }}" source-mirror.git
+          cd source-mirror.git
 
-          def git_env():
-              e = {k: v for k, v in os.environ.items() if k not in ("GITHUB_TOKEN", "GH_TOKEN")}
-              e["GIT_TERMINAL_PROMPT"] = "0"
-              return e
-
-          def run_git(argv):
-              p = subprocess.run(argv, env=git_env())
-              if p.returncode != 0:
-                  raise SystemExit("git command failed (status %d). Check git output above." % p.returncode)
-
-          src_show, src_git = split_github_url("SOURCE_REPO_URL", os.environ["SOURCE_REPO_URL"])
-          dst_show, dst_git = split_github_url("BACKUP_REMOTE_URL", os.environ["BACKUP_REMOTE_URL"])
-
-          print("Clone URL (redacted):", src_show, flush=True)
-          print("Push URL (redacted):", dst_show, flush=True)
-
-          wd = tempfile.mkdtemp()
-          os.chdir(wd)
-
-          # URL-embedded creds + no helper; drop job token so it cannot override PAT.
-          run_git(
-              [
-                  "git",
-                  "-c",
-                  "credential.helper=",
-                  "clone",
-                  "--mirror",
-                  src_git,
-                  "source-mirror.git",
-              ]
-          )
-          os.chdir(os.path.join(wd, "source-mirror.git"))
-          run_git(["git", "remote", "set-url", "origin", dst_git])
-          run_git(
-              [
-                  "git",
-                  "-c",
-                  "credential.helper=",
-                  "push",
-                  "--mirror",
-                  "origin",
-              ]
-          )
-          PY
+          # Force mirror all refs to the backup repository.
+          git remote set-url origin "${{ secrets.BACKUP_REMOTE_URL }}"
+          git push --mirror origin
