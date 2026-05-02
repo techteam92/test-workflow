@@ -46,19 +46,28 @@ jobs:
             exit 1
           fi
 
+      # Job runs inside BACKUP repo → GITHUB_TOKEN is scoped to test-workflow only.
+      # Git/curl may send that token for every github.com request unless we drop it here.
       - name: Mirror source repo into backup repo
         if: steps.ny_time_gate.outputs.run_backup == 'true'
+        env:
+          SOURCE_REPO_URL: ${{ secrets.SOURCE_REPO_URL }}
+          BACKUP_REMOTE_URL: ${{ secrets.BACKUP_REMOTE_URL }}
         shell: bash
         run: |
           set -euo pipefail
+          unset GITHUB_TOKEN GH_TOKEN 2>/dev/null || true
+          git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+
+          git_run() { env -u GITHUB_TOKEN -u GH_TOKEN git -c credential.helper= "$@"; }
 
           WORKDIR="$(mktemp -d)"
           cd "$WORKDIR"
 
           # Clone source as a mirror (all refs, tags, branches).
-          git clone --mirror "${{ secrets.SOURCE_REPO_URL }}" source-mirror.git
+          git_run clone --mirror "$SOURCE_REPO_URL" source-mirror.git
           cd source-mirror.git
 
           # Force mirror all refs to the backup repository.
-          git remote set-url origin "${{ secrets.BACKUP_REMOTE_URL }}"
-          git push --mirror origin
+          git remote set-url origin "$BACKUP_REMOTE_URL"
+          git_run push --mirror origin
