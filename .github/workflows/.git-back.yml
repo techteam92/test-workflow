@@ -1,16 +1,19 @@
 # Sync source branch → destination branch (default: auto-pick main or master → mirror), then prune extras.
+# Schedule: once per day at noon US Eastern (workflow_dispatch runs immediately anytime).
 # Repo variables (optional): SOURCE_BRANCH_FOR_DEST_MAIN, DEST_MAIN_BRANCH, SYNC_BRANCH_NAMES,
 # AUTO_SOURCE_BRANCH_PRIORITY (comma list, default main,master), PRUNE_DEST_BRANCHES (true|false),
 # PRUNE_KEEP_BRANCHES (comma-separated; default keeps main + mirror).
 #
 # GitHub cannot delete the repository default branch via git push --delete; switch default branch first if needed.
 
-name: Sync source repo to destination every 12 hours
+name: Sync source repo to destination daily (noon US Eastern)
 
 on:
   schedule:
-    # Every 12 hours at minute 0 UTC (00:00 and 12:00 UTC).
-    - cron: "0 */12 * * *"
+    # GitHub cron is UTC-only. Noon America/New_York is 16:00 UTC (EDT) or 17:00 UTC (EST).
+    # Two slots + hour gate below → one real run per calendar day at noon Eastern.
+    - cron: "0 16 * * *"
+    - cron: "0 17 * * *"
   workflow_dispatch:
 
 permissions:
@@ -20,7 +23,26 @@ jobs:
   mirror-sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Gate to noon America/New_York (scheduled runs only)
+        id: et_noon_gate
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "run_sync=true" >> "$GITHUB_OUTPUT"
+            echo "Manual/event run: proceeding (no noon gate)."
+          else
+            NY_HOUR="$(TZ=America/New_York date +%H)"
+            if [ "$NY_HOUR" = "12" ]; then
+              echo "run_sync=true" >> "$GITHUB_OUTPUT"
+              echo "Scheduled run: Eastern local hour is 12 — syncing."
+            else
+              echo "run_sync=false" >> "$GITHUB_OUTPUT"
+              echo "Skipping scheduled run: Eastern local hour is $NY_HOUR (not 12)."
+            fi
+          fi
+
       - name: Validate required secrets
+        if: steps.et_noon_gate.outputs.run_sync == 'true'
         shell: bash
         run: |
           if [ -z "${{ secrets.SOURCE_REPO_URL }}" ]; then
@@ -35,6 +57,7 @@ jobs:
       # Runner injects GITHUB_TOKEN for this repo only; push uses PAT in BACKUP_REMOTE_URL.
       # Bash unset is not always enough; use PAT-only subprocess env + encoded HTTPS URLs.
       - name: Mirror source repo into destination repo
+        if: steps.et_noon_gate.outputs.run_sync == 'true'
         env:
           SOURCE_REPO_URL: ${{ secrets.SOURCE_REPO_URL }}
           BACKUP_REMOTE_URL: ${{ secrets.BACKUP_REMOTE_URL }}
