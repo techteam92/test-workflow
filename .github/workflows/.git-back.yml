@@ -73,12 +73,15 @@ jobs:
           WORKDIR="$(mktemp -d)"
           cd "$WORKDIR"
 
-          # GitHub Actions can inject http.https://github.com/.extraheader (GITHUB_TOKEN for this
-          # workflow repo). That overrides user:token in the URL and breaks clone/push to other repos.
+          # The job's GITHUB_TOKEN is scoped to this workflow repo (e.g. test-workflow). Git/curl may
+          # send it for every github.com HTTPS request unless we drop it for these commands.
+          unset GITHUB_TOKEN GH_TOKEN 2>/dev/null || true
           git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
 
+          git_bin() { env -u GITHUB_TOKEN -u GH_TOKEN git "$@"; }
+
           # Clone source as a mirror (all refs, tags, branches).
-          git \
+          git_bin \
             -c credential.helper= \
             -c http.https://github.com/.extraheader= \
             clone --mirror "$SRC" source-mirror.git
@@ -86,7 +89,7 @@ jobs:
 
           # Force mirror all refs to the backup repository.
           git remote set-url origin "$DST"
-          git \
+          git_bin \
             -c credential.helper= \
             -c http.https://github.com/.extraheader= \
             push --mirror origin
