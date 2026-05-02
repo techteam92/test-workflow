@@ -88,6 +88,8 @@ jobs:
               return redacted, authed
 
           _empty_cfg = None
+          # Runner $HOME often has .netrc / git helpers → libcurl sends wrong creds for github.com.
+          _clean_home = tempfile.mkdtemp(prefix="git-clean-home-")
 
           def empty_global_cfg():
               global _empty_cfg
@@ -111,6 +113,13 @@ jobs:
               e["GIT_TERMINAL_PROMPT"] = "0"
               e["GIT_CONFIG_GLOBAL"] = empty_global_cfg()
               e["GIT_CONFIG_NOSYSTEM"] = "true"
+              e["HOME"] = _clean_home
+              cfg = os.path.join(_clean_home, ".config")
+              cache = os.path.join(_clean_home, ".cache")
+              os.makedirs(cfg, exist_ok=True)
+              os.makedirs(cache, exist_ok=True)
+              e["XDG_CONFIG_HOME"] = cfg
+              e["XDG_CACHE_HOME"] = cache
               return e
 
           def run_git(argv):
