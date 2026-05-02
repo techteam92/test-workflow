@@ -1,33 +1,3 @@
-# -----------------------------------------------------------------------------
-# Two-repo sync (automated mirror)
-#
-# Setup:
-#   1. Repo A — source code (read access).
-#   2. Repo B — destination; this workflow should live HERE (same repo you push to),
-#      OR in any repo where you can add secrets — the job clones A and pushes to B
-#      using URLs + tokens below (no dependency on the workflow repo's contents).
-#
-# What runs:
-#   - Every 12 hours (UTC: 00:00 and 12:00): mirror-clone A, strip refs/pull/* (GitHub PR refs),
-#     then force-push only branches + tags to B (not git push --mirror — see comments below).
-#   - Manual: Actions → this workflow → "Run workflow".
-#
-# Required GitHub Actions secrets (repo where the workflow file exists → Settings → Secrets):
-#   SOURCE_REPO_URL    — HTTPS clone URL with PAT that can READ repo A:
-#                        https://YOUR_USER:PAT_WITH_REPO_READ@github.com/OWNER/source-repo.git
-#   BACKUP_REMOTE_URL — HTTPS URL with PAT that can WRITE repo B (contents_admin or repo scope):
-#                        https://YOUR_USER:PAT_WITH_REPO_WRITE@github.com/OWNER/destination-repo.git
-#
-# PAT tips: fine-grained token — Source: Contents read; Destination: Contents read/write.
-#           Classic PAT: repo scope covers both if both are yours/org.
-#
-# Why not `git push --mirror` to GitHub?
-#   - GitHub rejects refs/pull/* ("hidden refs").
-#   - GitHub refuses deleting the default branch (e.g. main) when the mirror omits it — sync breaks.
-# This workflow mirrors *clone* from source, then updates destination branches/tags only (destination-only
-# branches/tags are left alone unless you delete them manually).
-# -----------------------------------------------------------------------------
-
 name: Sync source repo to destination every 12 hours
 
 on:
@@ -61,6 +31,9 @@ jobs:
         env:
           SOURCE_REPO_URL: ${{ secrets.SOURCE_REPO_URL }}
           BACKUP_REMOTE_URL: ${{ secrets.BACKUP_REMOTE_URL }}
+          SYNC_BRANCH_NAMES: ${{ vars.SYNC_BRANCH_NAMES }}
+          SOURCE_BRANCH_FOR_DEST_MAIN: ${{ vars.SOURCE_BRANCH_FOR_DEST_MAIN }}
+          DEST_MAIN_BRANCH: ${{ vars.DEST_MAIN_BRANCH }}
         shell: bash
         run: |
           set -euo pipefail
@@ -74,6 +47,24 @@ jobs:
 
           def trim(s):
               return "".join(s.split())
+
+          dest_main_branch = trim(os.environ.get("DEST_MAIN_BRANCH", "") or "") or "main"
+          source_as_main = trim(os.environ.get("SOURCE_BRANCH_FOR_DEST_MAIN", "") or "")
+          sync_raw = trim(os.environ.get("SYNC_BRANCH_NAMES", "") or "")
+          branch_allow = None
+          if source_as_main:
+              print(
+                  "Single-branch → destination %s: source branch %r → refs/heads/%s"
+                  % (dest_main_branch, source_as_main, dest_main_branch),
+                  flush=True,
+              )
+          elif sync_raw:
+              branch_allow = set(x.strip() for x in sync_raw.split(",") if trim(x))
+              print(
+                  "Branch filter (SYNC_BRANCH_NAMES): %s"
+                  % ", ".join(sorted(branch_allow)),
+                  flush=True,
+              )
 
           def split_url(label, raw):
               raw = trim(raw)
@@ -158,10 +149,33 @@ jobs:
               if refs:
                   print("Dropped %d refs/pull ref(s) before push." % len(refs), flush=True)
 
+          def short_branch_name(ref):
+              p = "refs/heads/"
+              if ref.startswith(p):
+                  return ref[len(p) :]
+              return ref
+
           def force_push_specs():
               specs = []
-              for ref in list_refs("refs/heads"):
-                  specs.append("+%s:%s" % (ref, ref))
+              if source_as_main:
+                  src_ref = "refs/heads/%s" % source_as_main
+                  heads = list_refs("refs/heads")
+                  if src_ref not in heads:
+                      raise SystemExit(
+                          "SOURCE_BRANCH_FOR_DEST_MAIN=%r not found on source (have: %s)."
+                          % (
+                              source_as_main,
+                              ", ".join(sorted(short_branch_name(h) for h in heads))
+                              or "(none)",
+                          )
+                      )
+                  dst_ref = "refs/heads/%s" % dest_main_branch
+                  specs.append("+%s:%s" % (src_ref, dst_ref))
+              else:
+                  for ref in list_refs("refs/heads"):
+                      if branch_allow is not None and short_branch_name(ref) not in branch_allow:
+                          continue
+                      specs.append("+%s:%s" % (ref, ref))
               for ref in list_refs("refs/tags"):
                   specs.append("+%s:%s" % (ref, ref))
               return specs
@@ -187,6 +201,8 @@ jobs:
           os.chdir(os.path.join(wd, "source-mirror.git"))
           strip_pull_refs()
           run_git(["git", "remote", "set-url", "origin", dst_git])
+          # clone --mirror sets remote.origin.mirror=true; explicit refspec pushes require mirror=false.
+          run_git(["git", "config", "--bool", "remote.origin.mirror", "false"])
           specs = force_push_specs()
           if not specs:
               raise SystemExit("No refs/heads or refs/tags on source after clone; nothing to push.")
