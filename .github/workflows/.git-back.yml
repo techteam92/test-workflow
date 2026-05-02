@@ -1,6 +1,7 @@
-# Sync source branch → destination branch (default: main → mirror), then prune extra heads on destination.
+# Sync source branch → destination branch (default: auto-pick main or master → mirror), then prune extras.
 # Repo variables (optional): SOURCE_BRANCH_FOR_DEST_MAIN, DEST_MAIN_BRANCH, SYNC_BRANCH_NAMES,
-# PRUNE_DEST_BRANCHES (true|false), PRUNE_KEEP_BRANCHES (comma-separated; default keeps main + mirror).
+# AUTO_SOURCE_BRANCH_PRIORITY (comma list, default main,master), PRUNE_DEST_BRANCHES (true|false),
+# PRUNE_KEEP_BRANCHES (comma-separated; default keeps main + mirror).
 #
 # GitHub cannot delete the repository default branch via git push --delete; switch default branch first if needed.
 
@@ -42,6 +43,7 @@ jobs:
           DEST_MAIN_BRANCH: ${{ vars.DEST_MAIN_BRANCH }}
           PRUNE_DEST_BRANCHES: ${{ vars.PRUNE_DEST_BRANCHES }}
           PRUNE_KEEP_BRANCHES: ${{ vars.PRUNE_KEEP_BRANCHES }}
+          AUTO_SOURCE_BRANCH_PRIORITY: ${{ vars.AUTO_SOURCE_BRANCH_PRIORITY }}
         shell: bash
         run: |
           set -euo pipefail
@@ -60,6 +62,7 @@ jobs:
           sync_raw = trim(os.environ.get("SYNC_BRANCH_NAMES", "") or "")
           source_as_main = trim(os.environ.get("SOURCE_BRANCH_FOR_DEST_MAIN", "") or "")
           branch_allow = None
+          auto_pick_source_branch = False
           if sync_raw:
               branch_allow = set(x.strip() for x in sync_raw.split(",") if trim(x))
               source_as_main = ""
@@ -68,17 +71,20 @@ jobs:
                   % ", ".join(sorted(branch_allow)),
                   flush=True,
               )
-          elif not source_as_main:
-              source_as_main = "main"
-              print(
-                  "Default single-branch sync: source %r → destination %r"
-                  % (source_as_main, dest_main_branch),
-                  flush=True,
-              )
-          else:
+          elif source_as_main:
               print(
                   "Single-branch → destination %s: source branch %r → refs/heads/%s"
                   % (dest_main_branch, source_as_main, dest_main_branch),
+                  flush=True,
+              )
+          else:
+              auto_pick_source_branch = True
+              priority_hint = (
+                  trim(os.environ.get("AUTO_SOURCE_BRANCH_PRIORITY", "") or "") or "main,master"
+              )
+              print(
+                  "Single-branch sync: will auto-pick source branch (priority %s) → destination %r"
+                  % (priority_hint, dest_main_branch),
                   flush=True,
               )
 
@@ -182,6 +188,26 @@ jobs:
                   return ref[len(p) :]
               return ref
 
+          def resolve_auto_source_branch():
+              heads_list = list_refs("refs/heads")
+              heads_short = set(short_branch_name(h) for h in heads_list)
+              priority_raw = (
+                  trim(os.environ.get("AUTO_SOURCE_BRANCH_PRIORITY", "") or "") or "main,master"
+              )
+              candidates = [trim(x) for x in priority_raw.split(",") if trim(x)]
+              for cand in candidates:
+                  if cand in heads_short:
+                      return cand
+              raise SystemExit(
+                  "No source branch matched AUTO_SOURCE_BRANCH_PRIORITY (%s). "
+                  "Set SOURCE_BRANCH_FOR_DEST_MAIN (e.g. master or home-screen). "
+                  "Branches on source: %s"
+                  % (
+                      ", ".join(candidates),
+                      ", ".join(sorted(heads_short)) or "(none)",
+                  )
+              )
+
           def prune_destination_branches():
               if not prune_enabled:
                   print("Skipping remote branch prune (PRUNE_DEST_BRANCHES disabled).", flush=True)
@@ -241,7 +267,8 @@ jobs:
                   heads = list_refs("refs/heads")
                   if src_ref not in heads:
                       raise SystemExit(
-                          "SOURCE_BRANCH_FOR_DEST_MAIN=%r not found on source (have: %s)."
+                          "Source branch %r not found on source (have: %s). "
+                          "Fix SOURCE_BRANCH_FOR_DEST_MAIN or AUTO_SOURCE_BRANCH_PRIORITY."
                           % (
                               source_as_main,
                               ", ".join(sorted(short_branch_name(h) for h in heads))
@@ -282,6 +309,13 @@ jobs:
           run_git(["git", "remote", "set-url", "origin", dst_git])
           # clone --mirror sets remote.origin.mirror=true; explicit refspec pushes require mirror=false.
           run_git(["git", "config", "--bool", "remote.origin.mirror", "false"])
+          if auto_pick_source_branch:
+              source_as_main = resolve_auto_source_branch()
+              print(
+                  "Auto-selected source branch %r → refs/heads/%s"
+                  % (source_as_main, dest_main_branch),
+                  flush=True,
+              )
           specs = force_push_specs()
           if not specs:
               raise SystemExit("No refs/heads or refs/tags on source after clone; nothing to push.")
