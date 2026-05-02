@@ -46,8 +46,8 @@ jobs:
             exit 1
           fi
 
-      # Job runs inside BACKUP repo → GITHUB_TOKEN is scoped to test-workflow only.
-      # Git/curl may send that token for every github.com request unless we drop it here.
+      # Job runs inside BACKUP repo: runner injects GITHUB_TOKEN scoped to this repo only.
+      # Bash unset is not always enough; use PAT-only subprocess env + encoded HTTPS URLs.
       - name: Mirror source repo into backup repo
         if: steps.ny_time_gate.outputs.run_backup == 'true'
         env:
@@ -58,16 +58,94 @@ jobs:
           set -euo pipefail
           unset GITHUB_TOKEN GH_TOKEN 2>/dev/null || true
           git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          python3 << 'PY'
+          import os
+          import subprocess
+          import tempfile
+          from urllib.parse import quote, unquote, urlparse, urlunparse
 
-          git_run() { env -u GITHUB_TOKEN -u GH_TOKEN git -c credential.helper= "$@"; }
+          def trim(s):
+              return "".join(s.split())
 
-          WORKDIR="$(mktemp -d)"
-          cd "$WORKDIR"
+          def split_url(label, raw):
+              raw = trim(raw)
+              p = urlparse(raw)
+              if p.scheme not in ("http", "https") or not p.hostname:
+                  raise SystemExit("%s: invalid URL" % label)
+              if p.hostname.lower() != "github.com":
+                  raise SystemExit("%s: only https://github.com/..." % label)
+              user = unquote(p.username or "")
+              password = unquote(p.password or "")
+              if not user or not password:
+                  raise SystemExit("%s: use https://USER:TOKEN@github.com/owner/repo.git" % label)
+              host = p.hostname
+              if p.port:
+                  host = "%s:%s" % (p.hostname, p.port)
+              redacted = urlunparse((p.scheme, host, p.path, "", "", ""))
+              uq = quote(user, safe="")
+              pq = quote(password, safe="")
+              authed = urlunparse((p.scheme, "%s:%s@%s" % (uq, pq, host), p.path, "", "", ""))
+              return redacted, authed
 
-          # Clone source as a mirror (all refs, tags, branches).
-          git_run clone --mirror "$SOURCE_REPO_URL" source-mirror.git
-          cd source-mirror.git
+          _empty_cfg = None
 
-          # Force mirror all refs to the backup repository.
-          git remote set-url origin "$BACKUP_REMOTE_URL"
-          git_run push --mirror origin
+          def empty_global_cfg():
+              global _empty_cfg
+              if _empty_cfg is None:
+                  fd, path = tempfile.mkstemp(prefix="git-empty-config-")
+                  os.close(fd)
+                  _empty_cfg = path
+              return _empty_cfg
+
+          def git_env():
+              drop = (
+                  "GITHUB_TOKEN",
+                  "GH_TOKEN",
+                  "ACTIONS_ID_TOKEN",
+              )
+              e = {}
+              for k, v in os.environ.items():
+                  if k in drop:
+                      continue
+                  e[k] = v
+              e["GIT_TERMINAL_PROMPT"] = "0"
+              e["GIT_CONFIG_GLOBAL"] = empty_global_cfg()
+              e["GIT_CONFIG_NOSYSTEM"] = "true"
+              return e
+
+          def run_git(argv):
+              r = subprocess.run(argv, env=git_env())
+              if r.returncode != 0:
+                  raise SystemExit("git failed with exit code %d (see log above)." % r.returncode)
+
+          src_show, src_git = split_url("SOURCE_REPO_URL", os.environ["SOURCE_REPO_URL"])
+          dst_show, dst_git = split_url("BACKUP_REMOTE_URL", os.environ["BACKUP_REMOTE_URL"])
+          print("Clone URL (redacted):", src_show, flush=True)
+          print("Push URL (redacted):", dst_show, flush=True)
+
+          wd = tempfile.mkdtemp()
+          os.chdir(wd)
+          run_git(
+              [
+                  "git",
+                  "-c",
+                  "credential.helper=",
+                  "clone",
+                  "--mirror",
+                  src_git,
+                  "source-mirror.git",
+              ]
+          )
+          os.chdir(os.path.join(wd, "source-mirror.git"))
+          run_git(["git", "remote", "set-url", "origin", dst_git])
+          run_git(
+              [
+                  "git",
+                  "-c",
+                  "credential.helper=",
+                  "push",
+                  "--mirror",
+                  "origin",
+              ]
+          )
+          PY
