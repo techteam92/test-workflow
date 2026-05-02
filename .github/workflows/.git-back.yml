@@ -1,3 +1,9 @@
+# Sync source branch → destination branch (default: main → mirror), then prune extra heads on destination.
+# Repo variables (optional): SOURCE_BRANCH_FOR_DEST_MAIN, DEST_MAIN_BRANCH, SYNC_BRANCH_NAMES,
+# PRUNE_DEST_BRANCHES (true|false), PRUNE_KEEP_BRANCHES (comma-separated; default keeps main + mirror).
+#
+# GitHub cannot delete the repository default branch via git push --delete; switch default branch first if needed.
+
 name: Sync source repo to destination every 12 hours
 
 on:
@@ -34,6 +40,8 @@ jobs:
           SYNC_BRANCH_NAMES: ${{ vars.SYNC_BRANCH_NAMES }}
           SOURCE_BRANCH_FOR_DEST_MAIN: ${{ vars.SOURCE_BRANCH_FOR_DEST_MAIN }}
           DEST_MAIN_BRANCH: ${{ vars.DEST_MAIN_BRANCH }}
+          PRUNE_DEST_BRANCHES: ${{ vars.PRUNE_DEST_BRANCHES }}
+          PRUNE_KEEP_BRANCHES: ${{ vars.PRUNE_KEEP_BRANCHES }}
         shell: bash
         run: |
           set -euo pipefail
@@ -48,23 +56,37 @@ jobs:
           def trim(s):
               return "".join(s.split())
 
-          dest_main_branch = trim(os.environ.get("DEST_MAIN_BRANCH", "") or "") or "main"
-          source_as_main = trim(os.environ.get("SOURCE_BRANCH_FOR_DEST_MAIN", "") or "")
+          dest_main_branch = trim(os.environ.get("DEST_MAIN_BRANCH", "") or "") or "mirror"
           sync_raw = trim(os.environ.get("SYNC_BRANCH_NAMES", "") or "")
+          source_as_main = trim(os.environ.get("SOURCE_BRANCH_FOR_DEST_MAIN", "") or "")
           branch_allow = None
-          if source_as_main:
-              print(
-                  "Single-branch → destination %s: source branch %r → refs/heads/%s"
-                  % (dest_main_branch, source_as_main, dest_main_branch),
-                  flush=True,
-              )
-          elif sync_raw:
+          if sync_raw:
               branch_allow = set(x.strip() for x in sync_raw.split(",") if trim(x))
+              source_as_main = ""
               print(
                   "Branch filter (SYNC_BRANCH_NAMES): %s"
                   % ", ".join(sorted(branch_allow)),
                   flush=True,
               )
+          elif not source_as_main:
+              source_as_main = "main"
+              print(
+                  "Default single-branch sync: source %r → destination %r"
+                  % (source_as_main, dest_main_branch),
+                  flush=True,
+              )
+          else:
+              print(
+                  "Single-branch → destination %s: source branch %r → refs/heads/%s"
+                  % (dest_main_branch, source_as_main, dest_main_branch),
+                  flush=True,
+              )
+
+          prune_flag = trim(os.environ.get("PRUNE_DEST_BRANCHES", "") or "").lower()
+          prune_enabled = prune_flag not in ("0", "false", "no", "off")
+          keep_raw = trim(os.environ.get("PRUNE_KEEP_BRANCHES", "") or "") or "main,mirror"
+          prune_keep = set(trim(x) for x in keep_raw.split(",") if trim(x))
+          prune_keep.add(dest_main_branch)
 
           def split_url(label, raw):
               raw = trim(raw)
@@ -126,6 +148,11 @@ jobs:
               if r.returncode != 0:
                   raise SystemExit("git failed with exit code %d (see log above)." % r.returncode)
 
+          def run_git_warn(argv):
+              r = subprocess.run(argv, env=git_env())
+              if r.returncode != 0:
+                  print("warning: git returned %d for: %s" % (r.returncode, argv), flush=True)
+
           def list_refs(prefix):
               r = subprocess.run(
                   ["git", "for-each-ref", "--format=%(refname)", prefix],
@@ -154,6 +181,58 @@ jobs:
               if ref.startswith(p):
                   return ref[len(p) :]
               return ref
+
+          def prune_destination_branches():
+              if not prune_enabled:
+                  print("Skipping remote branch prune (PRUNE_DEST_BRANCHES disabled).", flush=True)
+                  return
+              if branch_allow is not None:
+                  print("Skipping remote branch prune (SYNC_BRANCH_NAMES multi-branch mode).", flush=True)
+                  return
+              r = subprocess.run(
+                  ["git", "ls-remote", "--heads", "origin"],
+                  env=git_env(),
+                  capture_output=True,
+                  text=True,
+              )
+              if r.returncode != 0:
+                  raise SystemExit("git ls-remote failed listing destination heads.")
+              heads_prefix = "refs/heads/"
+              to_delete = []
+              for line in r.stdout.splitlines():
+                  line = line.strip()
+                  if not line or "\t" not in line:
+                      continue
+                  _sha, ref = line.split("\t", 1)
+                  ref = ref.strip()
+                  if not ref.startswith(heads_prefix):
+                      continue
+                  short = ref[len(heads_prefix) :]
+                  if short not in prune_keep:
+                      to_delete.append(short)
+              if not to_delete:
+                  print("No extra destination branches to prune.", flush=True)
+                  return
+              print(
+                  "Pruning destination branches (not in keep set %s): %s"
+                  % (
+                      ", ".join(sorted(prune_keep)),
+                      ", ".join(sorted(to_delete)),
+                  ),
+                  flush=True,
+              )
+              for name in sorted(to_delete):
+                  run_git_warn(
+                      [
+                          "git",
+                          "-c",
+                          "credential.helper=",
+                          "push",
+                          "origin",
+                          "--delete",
+                          name,
+                      ]
+                  )
 
           def force_push_specs():
               specs = []
@@ -207,4 +286,5 @@ jobs:
           if not specs:
               raise SystemExit("No refs/heads or refs/tags on source after clone; nothing to push.")
           run_git(["git", "-c", "credential.helper=", "push", "origin"] + specs)
+          prune_destination_branches()
           PY
