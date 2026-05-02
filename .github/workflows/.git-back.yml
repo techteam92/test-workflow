@@ -8,7 +8,8 @@
 #      using URLs + tokens below (no dependency on the workflow repo's contents).
 #
 # What runs:
-#   - Every 12 hours (UTC: 00:00 and 12:00): full mirror clone from A → mirror push to B.
+#   - Every 12 hours (UTC: 00:00 and 12:00): mirror-clone A, strip refs/pull/* (GitHub PR refs),
+#     then force-push only branches + tags to B (not git push --mirror — see comments below).
 #   - Manual: Actions → this workflow → "Run workflow".
 #
 # Required GitHub Actions secrets (repo where the workflow file exists → Settings → Secrets):
@@ -20,7 +21,11 @@
 # PAT tips: fine-grained token — Source: Contents read; Destination: Contents read/write.
 #           Classic PAT: repo scope covers both if both are yours/org.
 #
-# Note: --mirror copies all refs (branches, tags). Destination becomes a mirror of source.
+# Why not `git push --mirror` to GitHub?
+#   - GitHub rejects refs/pull/* ("hidden refs").
+#   - GitHub refuses deleting the default branch (e.g. main) when the mirror omits it — sync breaks.
+# This workflow mirrors *clone* from source, then updates destination branches/tags only (destination-only
+# branches/tags are left alone unless you delete them manually).
 # -----------------------------------------------------------------------------
 
 name: Sync source repo to destination every 12 hours
@@ -50,7 +55,7 @@ jobs:
             exit 1
           fi
 
-      # Runner injects GITHUB_TOKEN for this repo only; mirror push uses PAT in BACKUP_REMOTE_URL.
+      # Runner injects GITHUB_TOKEN for this repo only; push uses PAT in BACKUP_REMOTE_URL.
       # Bash unset is not always enough; use PAT-only subprocess env + encoded HTTPS URLs.
       - name: Mirror source repo into destination repo
         env:
@@ -130,6 +135,37 @@ jobs:
               if r.returncode != 0:
                   raise SystemExit("git failed with exit code %d (see log above)." % r.returncode)
 
+          def list_refs(prefix):
+              r = subprocess.run(
+                  ["git", "for-each-ref", "--format=%(refname)", prefix],
+                  env=git_env(),
+                  capture_output=True,
+                  text=True,
+              )
+              if r.returncode != 0:
+                  raise SystemExit("git for-each-ref failed listing %s." % prefix)
+              out = []
+              for ln in r.stdout.splitlines():
+                  ln = ln.strip()
+                  if ln:
+                      out.append(ln)
+              return out
+
+          def strip_pull_refs():
+              refs = list_refs("refs/pull")
+              for ref in refs:
+                  run_git(["git", "update-ref", "-d", ref])
+              if refs:
+                  print("Dropped %d refs/pull ref(s) before push." % len(refs), flush=True)
+
+          def force_push_specs():
+              specs = []
+              for ref in list_refs("refs/heads"):
+                  specs.append("+%s:%s" % (ref, ref))
+              for ref in list_refs("refs/tags"):
+                  specs.append("+%s:%s" % (ref, ref))
+              return specs
+
           src_show, src_git = split_url("SOURCE_REPO_URL", os.environ["SOURCE_REPO_URL"])
           dst_show, dst_git = split_url("BACKUP_REMOTE_URL", os.environ["BACKUP_REMOTE_URL"])
           print("Source clone URL (redacted):", src_show, flush=True)
@@ -149,15 +185,10 @@ jobs:
               ]
           )
           os.chdir(os.path.join(wd, "source-mirror.git"))
+          strip_pull_refs()
           run_git(["git", "remote", "set-url", "origin", dst_git])
-          run_git(
-              [
-                  "git",
-                  "-c",
-                  "credential.helper=",
-                  "push",
-                  "--mirror",
-                  "origin",
-              ]
-          )
+          specs = force_push_specs()
+          if not specs:
+              raise SystemExit("No refs/heads or refs/tags on source after clone; nothing to push.")
+          run_git(["git", "-c", "credential.helper=", "push", "origin"] + specs)
           PY
