@@ -60,36 +60,79 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 << 'PY'
+          import base64
+          import os
+          import subprocess
+          import tempfile
+          from urllib.parse import unquote, urlparse, urlunparse
 
-          trim_url() { printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
-          SRC="$(trim_url "$SOURCE_REPO_URL")"
-          DST="$(trim_url "$BACKUP_REMOTE_URL")"
+          def trim(s: str) -> str:
+              return "".join(s.split())
 
-          # Prove which repos Actions sees (no token in log).
-          redact_git_url() { echo "$1" | sed -E 's#https?://[^@]+@#https://#'; }
-          echo "Clone URL (redacted): $(redact_git_url "$SRC")"
-          echo "Push URL (redacted):   $(redact_git_url "$DST")"
+          def split_github_url(label: str, raw: str):
+              raw = trim(raw)
+              p = urlparse(raw)
+              if p.scheme not in ("http", "https") or not p.hostname:
+                  raise SystemExit(f"{label}: invalid URL")
+              if p.hostname.lower() != "github.com":
+                  raise SystemExit(f"{label}: only https://github.com/... is supported")
+              user = unquote(p.username or "")
+              password = unquote(p.password or "")
+              if not user or password == "":
+                  raise SystemExit(
+                      f"{label}: use https://USERNAME:TOKEN@github.com/owner/repo.git"
+                  )
+              host = p.hostname
+              if p.port:
+                  host = f"{p.hostname}:{p.port}"
+              clean = urlunparse((p.scheme, host, p.path, "", "", ""))
+              basic = base64.b64encode(f"{user}:{password}".encode()).decode()
+              header = f"AUTHORIZATION: basic {basic}"
+              return clean, header
 
-          WORKDIR="$(mktemp -d)"
-          cd "$WORKDIR"
+          def git_env():
+              e = {k: v for k, v in os.environ.items() if k not in ("GITHUB_TOKEN", "GH_TOKEN")}
+              e["GIT_TERMINAL_PROMPT"] = "0"
+              return e
 
-          # The job's GITHUB_TOKEN is scoped to this workflow repo (e.g. test-workflow). Git/curl may
-          # send it for every github.com HTTPS request unless we drop it for these commands.
-          unset GITHUB_TOKEN GH_TOKEN 2>/dev/null || true
-          git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          def run_git(args):
+              subprocess.run(args, check=True, env=git_env())
 
-          git_bin() { env -u GITHUB_TOKEN -u GH_TOKEN git "$@"; }
+          src_clean, src_hdr = split_github_url("SOURCE_REPO_URL", os.environ["SOURCE_REPO_URL"])
+          dst_clean, dst_hdr = split_github_url("BACKUP_REMOTE_URL", os.environ["BACKUP_REMOTE_URL"])
 
-          # Clone source as a mirror (all refs, tags, branches).
-          git_bin \
-            -c credential.helper= \
-            -c http.https://github.com/.extraheader= \
-            clone --mirror "$SRC" source-mirror.git
-          cd source-mirror.git
+          print("Clone (credential-less URL):", src_clean)
+          print("Push (credential-less URL):", dst_clean)
 
-          # Force mirror all refs to the backup repository.
-          git remote set-url origin "$DST"
-          git_bin \
-            -c credential.helper= \
-            -c http.https://github.com/.extraheader= \
-            push --mirror origin
+          wd = tempfile.mkdtemp()
+          os.chdir(wd)
+
+          run_git(
+              [
+                  "git",
+                  "-c",
+                  "credential.helper=",
+                  "-c",
+                  f"http.extraHeader={src_hdr}",
+                  "clone",
+                  "--mirror",
+                  src_clean,
+                  "source-mirror.git",
+              ]
+          )
+          os.chdir(os.path.join(wd, "source-mirror.git"))
+          run_git(["git", "remote", "set-url", "origin", dst_clean])
+          run_git(
+              [
+                  "git",
+                  "-c",
+                  "credential.helper=",
+                  "-c",
+                  f"http.extraHeader={dst_hdr}",
+                  "push",
+                  "--mirror",
+                  "origin",
+              ]
+          )
+          PY
