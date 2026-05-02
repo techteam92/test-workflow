@@ -6,6 +6,7 @@ on:
     # This avoids DST drift between EST and EDT.
     - cron: "0 16 * * *"
     - cron: "0 17 * * *"
+  # Run from Actions tab for an immediate mirror (bypasses New York time gate).
   workflow_dispatch:
 
 permissions:
@@ -15,16 +16,21 @@ jobs:
   mirror-backup:
     runs-on: ubuntu-latest
     steps:
-      - name: Gate run to Noon America/New_York
+      - name: Gate run to Noon America/New_York (scheduled only)
         id: ny_time_gate
         shell: bash
         run: |
-          NY_HOUR="$(TZ=America/New_York date +%H)"
-          if [ "$NY_HOUR" = "12" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "run_backup=true" >> "$GITHUB_OUTPUT"
+            echo "Manual run: mirroring immediately (time gate skipped)."
           else
-            echo "run_backup=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping: current New York hour is $NY_HOUR, not 12."
+            NY_HOUR="$(TZ=America/New_York date +%H)"
+            if [ "$NY_HOUR" = "12" ]; then
+              echo "run_backup=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run_backup=false" >> "$GITHUB_OUTPUT"
+              echo "Skipping: current New York hour is $NY_HOUR, not 12."
+            fi
           fi
 
       - name: Validate required secrets
